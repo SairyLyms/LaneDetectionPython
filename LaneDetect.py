@@ -37,26 +37,27 @@ def weighted_img(img, initial_img, α=0.8, β=1., λ=0.):
     return cv2.addWeighted(initial_img, α, img, β, λ)
 
 def displayImage(img):
-    cv2.namedWindow("window")
-    cv2.imshow("window", img)
-    cv2.imshow('image', img)
-    cv2.waitKey(1)
-    cv2.destroyAllWindows()
-    cv2.waitKey(1)
-
-
-
-
+    plt.figure(figsize=(12,8))
+    plt.imshow(img)
+    plt.gray()
+    plt.show()
+ 
 def ReadVideoFrameBinary():
     low_threshold = 100
     high_threshold = 200
-    cap = cv2.VideoCapture('Sample.mp4')
+    cap = cv2.VideoCapture('sample.mp4')
     if cap.isOpened():
         rval , frame = cap.read()
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    frame = cv2.Canny(frame, low_threshold, high_threshold)
+    #frame = cv2.Canny(frame, low_threshold, high_threshold)
+    frame = cv2.convertScaleAbs(cv2.Sobel(frame, cv2.CV_32F, 1,0,ksize=3))
+    frame = cv2.convertScaleAbs(frame)
     displayImage(frame)
     return frame
+
+def ConnectXline(img_SobelX):
+    imgThreshold = img_SobelX * (img_SobelX > 100))
+    
 
 
 ReadVideoFrameBinary()
