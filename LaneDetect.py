@@ -7,14 +7,9 @@ import math
 
 
 def ReadVideoFrameBinary(frame):
-    low_threshold = 100
-    high_threshold = 200    
-    
-    frameHSV = cv2.cvtColor(frame[300:,:,:], cv2.COLOR_BGR2HSV)
+    frameHSV = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     frame = frameHSV[:,:,2]
-    displayImage(frame)
     frame = cv2.convertScaleAbs(cv2.Sobel(frame, cv2.CV_32F, 1,0,ksize=3))
-    frame = ipm(frame)
     frame = cv2.convertScaleAbs(frame) > 80
     
     #displayImage(frame)
@@ -22,9 +17,16 @@ def ReadVideoFrameBinary(frame):
     
     return frame
 
-def displayImage(img):
-    plt.figure(figsize=(12,8))
-    plt.imshow(img)
+def displayImageLwr(img):
+    #plt.figure(figsize=(12,8))
+    plt.imshow(img,origin='lower')
+    #plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    plt.gray()
+    plt.show()
+
+def displayImageUpr(img):
+    #plt.figure(figsize=(12,8))
+    plt.imshow(img,origin='upper')
     #plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     plt.gray()
     plt.show()
@@ -35,35 +37,52 @@ def displayScatter(x,y):
     plt.axis('equal')
     plt.show()
 
-def TopViewTransform(frame,focalLen,tilt,height):
-    x = 200
-    y = 300
-    xMax = 10
-    yMax = 5
-    
-    hvc = 5
-    fvc = 600
-    dvc = 5
-    
-    tx = fvc/hvc * height * x/(focalLen*math.sin(tilt)-y*math.cos(tilt))
-    ty = fvc/hvc * height * ((focalLen*math.cos(tilt) + y*math.sin(tilt))/(focalLen*math.sin(tilt)-y*math.cos(tilt)) - dvc)
+def TopViewTransform(frame):
+    #チルト角
+    tiltdeg = 25
+    height = 60
+    f = 320/2 * np.tan(1.04)
+    w, h = 320, 240
 
-#    tx = focalLen * x/(y*math.cos(tilt) + height*math.sin(tilt)) + xMax/2
-#    ty = focalLen * (height * math.cos(tilt) - y * math.sin(tilt))/(y*math.cos(tilt) + height*math.sin(tilt)) + yMax/2
+    tilt = np.deg2rad(tiltdeg)      
+    #3D変換
+    A = np.matrix([
+        [1,0,-w/2],
+        [0,0,0],
+        [0,1,-h/2],
+        [0,0,1]])
+    #回転
+    R= np.matrix([
+        [1,0,0,0],
+        [0, np.cos(tilt), -np.sin(tilt), 0],
+        [0, np.sin(tilt), np.cos(tilt), 0],
+        [0,0,0,1]])
+    #並進
+    T =np.matrix([
+        [1,0,0,0],
+        [0,1,0,0],
+        [0,0,1,-height/np.sin(tilt)],
+        [0,0,0,1]])
+    #カメラパラメータ
+    K =np.matrix([
+        [f, 0, w/2, 0],
+        [0, f, h/2,0],
+        [0, 0, 1, 0],])
+    #変換行列
+    H = K * (T * (R * A))
+    #パースペクティブ変換
+    warp = cv2.warpPerspective(frame, H, (320, 240),flags=cv2.WARP_INVERSE_MAP)
+    #トリミング範囲設定
+    areaCropBase = np.array([[0, 240], [320, 240]], dtype='float32')
+    #パースペクティブ変換後の座標取得
+    areaCrop = cv2.perspectiveTransform(np.array([areaCropBase]), H.I)
+    areaCrop = np.matrix([[areaCrop[0,1,0],0],[areaCrop[0,1,0],areaCrop[0,1,1]],[areaCrop[0,0,0],areaCrop[0,0,1]],[areaCrop[0,0,0],0]])
+    #トリミング
+    warp = warp[np.uint(areaCrop[0,1]):np.uint(areaCrop[2,1]),np.uint(areaCrop[0,0]):np.uint(areaCrop[2,0])]
+    #warp = np.fliplr(np.flipud(warp))
+    #displayImageLwr(warp)    
+    return warp
 
-#    tx = focalLen * x/(y*math.cos(tilt) + height*math.sin(tilt)) + xMax/2
-#    ty = focalLen * (height * math.cos(tilt) - y * math.sin(tilt))/(y*math.cos(tilt) + height*math.sin(tilt)) + yMax/2
-    
-#    d = abs(height*(math.sin(tilt)+focalLen+math.cos(tilt))/(focalLen*math.sin(tilt)-math.cos(tilt)))+1
-#    tx = height*((x*math.sin(tilt) + focalLen * math.cos(tilt))/(-y*math.cos(tilt)+focalLen*math.sin(tilt))) + d
-#    ty = height*((y*math.sin(tilt) + focalLen * math.cos(tilt))/(-y*math.cos(tilt)+focalLen*math.sin(tilt))) + d
-    
-def ipm(img):
-    ptssrc = np.float32([[395,50],[80,200],[575,50],[900,200]])
-    ptsdst = np.float32([[0,0],[0,512],[512,0],[512,512]])
-    MTrans = cv2.getPerspectiveTransform(ptssrc,ptsdst)
-    img = cv2.warpPerspective(img,MTrans,(512,512))
-    return img
 
 def SplitLRLanePixcel(frame):
    plt.imshow(frame)
@@ -105,26 +124,42 @@ def PolyFitClothoid(lanePixelsX, lanePixelsY):
     param_opt[2:4] = [-param_opt[2], -param_opt[3]]
     return param_opt #Clothoid param(fitted)
 
-cap = cv2.VideoCapture('solidYellowLeft.mp4')
 
-laneParamL = []
-laneParamR = []
+#TopViewTransform(frame)
+#displayImage(frame)
+#frame = ReadVideoFrameBinary(frame)
+
+#laneParamL = []
+#laneParamR = []
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT,240)
 
 """
+if cap.isOpened():
+    rval , frame = cap.read()
+#トップビュー変換
+frame = TopViewTransform(frame)
+#2値化
+#frame = ReadVideoFrameBinary(frame)
+
+#フィッティング
+##
+
+#表示
+displayImageUpr(frame)
+
+"""
+
 while(True):
     if cap.isOpened():
-        #cap.set(0,12000)
         rval , frame = cap.read()
+    frame = TopViewTransform(frame)
     frame = ReadVideoFrameBinary(frame)
-    lanePixelsL , lanePixelsR = SplitLRLanePixcel(frame)    
-    laneParamL.append(PolyFitClothoid(lanePixelsL[0], lanePixelsL[1]))
-    laneParamR.append(PolyFitClothoid(lanePixelsR[0], lanePixelsR[1]))
-    print(laneParamL[-1][2])
-    plt.show()
- 
+    cv2.namedWindow('window')
+    cv2.imshow('window', np.array(frame * 255, dtype=np.uint8))
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
-"""
 
 cap.release()
 cv2.destroyAllWindows()
