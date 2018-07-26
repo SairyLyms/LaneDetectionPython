@@ -1,10 +1,18 @@
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import numpy as np
+import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.optimize import least_squares
+from scipy import interpolate
 import cv2
 import math
+
+def zscore(x):
+    xmean = x.mean()
+    xstd  = np.std(x)
+    zscore = (x-xmean)/xstd
+    return zscore
 
 def displayImageLwr(img):
     #plt.figure(figsize=(12,8))
@@ -73,90 +81,140 @@ def plot_data_circle(x , y , xc, yc, R):
     
     
 def ReadVideoFrameBinary(frame):
-    frame = frameHSV[:,:,2]
-    frameSob = np.arctan2(cv2.Sobel(frame,cv2.CV_32F,0,1,ksize=5),cv2.Sobel(frame,cv2.CV_32F,1,0,ksize=5))
+    #床の色に合わせて明度・彩度マスクを変更すること
+    frameHSV = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    frameH =frameHSV[:,:,0]
+    frameS = frameHSV[:,:,1]
+    frameV = frameHSV[:,:,2]
+    frameSobScaleX = cv2.Sobel(frameV,cv2.CV_32F,1,0,ksize=5)
+    frameSobScaleY = cv2.Sobel(frameV,cv2.CV_32F,0,1,ksize=5)
     
+    frameSStd = zscore(frameS)#彩度標準化
+    frameVStd = zscore(frameV)#明度標準化
+    
+    #輪郭抽出
+    frameSobScaleX = zscore(frameSobScaleX)
+    frameSobScaleY = zscore(frameSobScaleY)
+    #輪郭情報からマスク画像生成
+    kernDilateEdge = np.ones((5,20),np.uint8)
+    maskEdge = cv2.dilate(np.uint8(frameSobScaleX > 3),kernDilateEdge,iterations = 1) *  cv2.dilate(np.uint8(frameSobScaleX > 3),kernDilateEdge,iterations = 1) #膨張
+    plt.imshow(frameSStd)
+    #彩度・明度情報からマスク画像生成(アスファルト・白線の場合)
+    thresS = 0.4 #彩度しきい値アスファルト用・白線用(パスフィルタ)
+    thresV = 1 #明度しきい値アスファルト用(パスフィルタ)
+    kernDilateSV = np.ones((5,20),np.uint8)#膨張用カーネル
+    maskS = cv2.erode(np.uint8(frameSStd < thresS),kernDilateSV,iterations = 1) > 0#彩度マスク
+    #maskV = cv2.dilate(np.uint8(frameVStd < thresV),kernDilateSV,iterations = 1) > 0#明度マスク
+    maskPassLine = (np.uint8(frameSStd > 2) * np.uint8(frameVStd > thresV) * np.uint8(frameH < 40) * np.uint8(frameH > 10))
+    #明度2値化画像をマスクして出力
+    ret , frameBin = cv2.threshold(frameV,0,1,cv2.THRESH_OTSU)
+    plt.imshow(frameBin*maskEdge*maskS + maskPassLine)
+    plt.show()
     #frame = cv2.convertScaleAbs(cv2.Sobel(frame, cv2.CV_32F, 1,0,ksize=3))#x方向のみエッジ検出(通常はこっち)
     #frame = cv2.convertScaleAbs(cv2.Sobel(frame, cv2.CV_32F, 0,1,ksize=3))#y方向のエッジ検出
-    frame = cv2.medianBlur(frame,5)
-    frame = cv2.convertScaleAbs(frame) > 80
+    return frameBin*maskEdge*maskS + maskPassLine
 
-    return frame
-
-
-
-def TopViewTransform(frame):
+def TopViewTransformPoints(frameBinary):
+    matPoint = np.matrix([frameBinary.nonzero()[1],frameBinary.nonzero()[0]])
+    matPoint = np.vstack((matPoint,np.ones([1,matPoint.shape[1]])))
+    
     #チルト角
-    tiltdeg = 14.5
+    tiltdeg = 18
     height = 100 #拡大率に相当(+:拡大)
     f = 500 / 2 * np.tan(1.04) #視野角に相当(+:望遠)
-    vanHeiPx = 425#消失点のY座標(pix)
-    frame = frame[vanHeiPx:vanHeiPx+220,:]
-    frame = cv2.fastNlMeansDenoisingColored(frame,None,10,20,10,21)
-    
-    w, h = frame.shape[1], frame.shape[0]
-    wdst,hdst = 128 , 128
+
+    w, h = frameBinary.shape[1] ,  frameBinary.shape[0]
     tilt = np.deg2rad(tiltdeg)
+
     #3D変換    
     A = np.matrix([
-        [1,0,0,-w/2],
+        [1,0,0,0],
         [0,0,0,0],
-        [0,0,1,-h/2],
+        [0,0,1,0],
         [0,0,0,1]])
+    
     #回転
     R= np.matrix([
         [1,0,0,0],
         [0,np.cos(tilt),-np.sin(tilt),0],
         [0,np.sin(tilt), np.cos(tilt),0],
         [0,0,0,1]])
+    
     #並進
     T =np.matrix([
         [1,0,0,0],
         [0,1,0,0],
         [0,0,1,-height/np.sin(tilt)],
         [0,0,0,0]])
+    
     #カメラパラメータ
     K =np.matrix([
         [f, 0,w/2,0],
         [0,f,h/2,0],
         [0, 0, 1,0],
         ])
+    
     #変換行列
-    H = K * (T * (R * A))
+    H = K * (T * (R* A))
     H = H[:,np.array([0,2,3])]
     
-    #パースペクティブ変換後の座標取得
-    areaCropBase = np.array([[0, 0],[0,h],[w,h],[w,0]], dtype='float32')
-    areaCrop = cv2.perspectiveTransform(np.array([areaCropBase]), H.I)
+    #点列を変換、勾配情報を付加
+    matPointTrans = cv2.perspectiveTransform(np.array([matPoint.T[:,0:2]]), H.I)[0].T
+    pointTrans = np.squeeze(np.asarray(matPointTrans))#MatrixからArrayへ変換
+    pointTrans[1,:] = -pointTrans[1,:]#距離情報反転する
+    pointTrans = pointTrans[:, pointTrans[0,:].argsort()]#x方向の値でソート
+    #IPM変換済みの点列情報をリターンする
+    return pointTrans
 
-    #拡大 処理用の正方形画像へ
-    E = np.matrix([
-        [wdst / (areaCrop[0,1,0] - areaCrop[0,2,0]), 0, 0],
-        [0, wdst / (areaCrop[0,1,0] - areaCrop[0,2,0]), 0],
-        [0, 0, 1]
-        ])
-    #移動 処理用の正方形画像へ
-    areaCrop = cv2.perspectiveTransform(np.array([areaCropBase]), E * H.I)
-    T2 = np.matrix([
-        [1, 0,-areaCrop[0,2,0]],
-        [0,1,wdst - areaCrop[0,2,1]],
-        [0, 0, 1]
-        ])
+def CreateTrajectory(pointTrans):
+    pointTrans = np.vstack((pointTrans,np.gradient(pointTrans[0,:])))#x方向の勾配  
+    pointTransList = np.split(pointTrans,np.where(pointTrans[2,:] > 5)[0],axis=1)#x方向の勾配を利用してレーンを分割
+    pointTransList = [elem for elem in pointTransList if elem.shape[1] > 100]#要素数がしきい値以下の場合は外れ値と見なし、削除する
+    #idea:主成分分析して固有ベクトルの比で外れ値をさらに減らす??
+    if pointTransList : #外れ値を削除して残ったレーン情報に関して処理継続する。
+    #各車線情報のプロット
+        plt.clf()
+        for elem in pointTransList:
+            plt.scatter(-elem[0,:],elem[1,:])
+        plt.axis('equal')
+        plt.grid()
+        plt.show()
+    #各車線情報のプロットおわり
+    #最近傍車線の横位置算出 : ステアリング制御用
+        latPosNearLine = np.array([elem[0,elem[1,:].argmin()] for elem in pointTransList])
+        latPosNearLine = [latPosNearLine[(latPosNearLine < 0)].max(),latPosNearLine[(latPosNearLine > 0)].min()]
+        pointTransList = [np.array([elem[0,:]-elem[0,elem[1,:].argmin()],elem[1,:],elem[2,:]]) for elem in pointTransList]#各レーンの初期x座標を0とする
+        pointTrans = np.concatenate(([elem for elem in pointTransList]), axis=1)#分割した要素を再度結合して戻す
+        pointTransunique = pd.DataFrame(pointTrans[0:2,:].T,columns=['x', 'y',])#pandasで距離方向の重複を削除しつつ、横位置の平均を出す
+        pointTransunique = pointTransunique.groupby('y').mean().reset_index()#↑
+        pointTrans = np.fliplr(pointTransunique.values).T#pandasからnumpy配列へ
+        pointTrans[1,:] = pointTrans[1,:] - pointTrans[1,0]#結合したので、初期のy座標を0にする
+    #Bスプライン補完による曲率算出 : 速度制御用
+        idx = np.array(np.interp(np.arange(0,pointTrans[1,-1],pointTrans[1,-1]*0.1),pointTrans[1,:],np.arange(pointTrans.shape[1])),dtype=np.int64)#等間隔距離インデックス取得
+        ctrlPoint = pointTrans[:,idx]
+        t,c,k = interpolate.splrep(ctrlPoint[1,:],ctrlPoint[0,:],s=0,k=3)
+        Spl=interpolate.BSpline(t,c,k)#Bスプライン関数
+        Spld1 = Spl.derivative(1)#Bスプライン1階微分
+        Spld2 = Spl.derivative(2)#Bスプライン2階微分
+        iptY = np.arange(0,ctrlPoint[1,-1],ctrlPoint[1,-1]*0.02)#Bスプライン補間用距離
+        cvmax = max(abs(Spld2(iptY)/pow((1+pow(Spld1(iptY),2)),1.5)))#Bスプライン補間による最大曲率
+    #最近傍車線検知
+    #Bスプライン補完のプロット
+        plt.figure()
+        plt.scatter(ctrlPoint[0,:],ctrlPoint[1,:])
+        plt.plot(Spl(iptY),iptY)
+        #plt.axis('equal' )
+        plt.xlim([-20,20])
+        plt.grid()
+        plt.show()
+        plt.figure()
+        plt.plot(Spld1(iptY),iptY)
+        plt.plot(Spld2(iptY),iptY)
+        plt.grid()
+        plt.show()
+    #速度制御用の曲率、ステア制御用に、自車近傍の車線情報・自車近傍の車線の傾きを出力する
+    return cvmax , latPosNearLine , Spld1(iptY[0])
     
-    #パースペクティブ変換
-    warp = cv2.warpPerspective(frame, T2 * E * H.I, (wdst,hdst))
-    #warp = cv2.warpPerspective(frame, H, (w, 1000),flags=cv2.WARP_INVERSE_MAP)
-    displayImageUpr(frame)
-    #displayImageLwr(warp)
-    warp = np.flipud(warp)
-    displayImageLwr(warp)    
-    return warp
-
-def Fit1D(frame) :
-    framevector =  np.where(frame)
-    framevector = np.array([framevector[0],framevector[1]],dtype=np.float).T
-    mean, eigenvectors = cv2.PCACompute(framevector, mean=np.array([], dtype=np.float), maxComponents=1)
-    #plt.show()
 
 def ejphi(phi0,phiv,phiu,s):
     return np.exp((phiu*s*s+phiv*s+phi0)*1j)
@@ -180,7 +238,7 @@ def PolyFitClothoid(frame):
     lanePixelsX , lanePixelsY = np.where(frame)
     lanePixelsX = lanePixelsX/frame.shape[0] #規格化
     lanePixelsY = lanePixelsY/frame.shape[0] #規格化
-    if frame[frame > 128].size > 100: #frameの範囲内に点が100点以上存在する場合
+    if frame[frame > 128].size > 500: #frameの範囲内に点が100点以上存在する場合
         try:
             param_opt[0:3], cov = curve_fit(FitFuncClothoidPhiv, lanePixelsX, lanePixelsY, param_init[0:3],bounds=param_bounds)
         except RuntimeError:
@@ -220,14 +278,14 @@ def LanePosDetectfromEachSector(sectorFrameBinary):
     # Draw the lines
     if linesInfo is not None and ~np.isnan(linesInfo).any() and ~np.isinf(linesInfo).any():
         for i in range(0, len(linesInfo)):
-            cv2.line(mask,(np.int(linesInfo[i][1]),0), (np.int(linesInfo[i][0]*sectorFrameBinary.shape[1] + linesInfo[i][1]),sectorFrameBinary.shape[1]), (255,255,255), 100)
+            #cv2.line(mask,(np.int(linesInfo[i][1]),0), (np.int(linesInfo[i][0]*sectorFrameBinary.shape[1] + linesInfo[i][1]),sectorFrameBinary.shape[1]), (255,255,255), 100)
             cv2.line(lineinterp,(np.int(linesInfo[i][1]),0), (np.int(linesInfo[i][0]*sectorFrameBinary.shape[1] + linesInfo[i][1]),sectorFrameBinary.shape[1]), (255,255,255), 2)
     #エラー時の処理
     else:
             return 0
     
-    #マスク画像のデバッグ用
-    plt.imshow(mask) 
+    #直線補完のデバッグ用
+    plt.imshow(lineinterp) 
     plt.show()
     #マスク処理
     sectorFrameBinary = np.logical_and(sectorFrameBinary,mask==255)
@@ -247,15 +305,6 @@ def LanePosDetectfromEachSector(sectorFrameBinary):
     #点列情報を格納し、Bスプライン補完してみる
     return 1
 
-def MaskingVehicle(frame):
-    masking = np.logical_or(frameHSV[:,:,0] < 10,frameHSV[:,:,0] > 150)
-    masking = np.logical_and(masking,frameHSV[:,:,1] > 140)
-    masking = cv2.medianBlur(np.uint8(masking),5)
-    displayImageUpr(masking)
-    plt.show()
-    0
-    #plt.plot(posLane)
-   # plt.show()
 #TopViewTransform(frame)
 #displayImage(frame)
 #frame = ReadVideoFrameBinary(frame)
@@ -263,8 +312,9 @@ def MaskingVehicle(frame):
 #laneParamL = []
 #laneParamR = []
 #cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture('solidYellowLeft.mp4')
 #cap = cv2.VideoCapture('solidWhiteRight.mp4')
-cap = cv2.VideoCapture('sample.mp4')
+#cap = cv2.VideoCapture('sample.mp4')
 while(True):
     if cap.isOpened():
         #cap.set(cv2.CAP_PROP_FRAME_WIDTH,960)
@@ -272,21 +322,20 @@ while(True):
         rval , frame = cap.read()
     
         #トップビュー変換
-    #    displayImageLwr(frame)
         #frame = TopViewTransform(frame)
         #LogPolar変換
         #frame = LogpolarTrans(frame)
-        #2値化
-       #frame = ReadVideoFrameBinary(frame)
        #yピクセルセクタ毎にレーン位置の抽出
         plt.figure()
         displayImageUpr(frame)
         plt.show()
-        frameHSV = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        #frameHSV = frameHSV[500:500+100,:]
-        MaskingVehicle(frameHSV)
-        frameHSV = ReadVideoFrameBinary(frameHSV)#2値化
-        LanePosDetectfromEachSector(frameHSV)
+       #2値化
+        frame = ReadVideoFrameBinary(frame[350:,:,:])
+        #IPM変換、車線点列情報取得
+        pointTrans = TopViewTransformPoints(frame)
+        #車線点列情報を用いた走行軌跡生成(b-spline法)
+        CreateTrajectory(pointTrans)
+        #LanePosDetectfromEachSector(frame)
 #displayImageUpr(frame)
 #フィッティング
 #frameR,frameL=np.array_split(frame,2,axis=1)
